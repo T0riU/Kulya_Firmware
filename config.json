@@ -1,0 +1,6 @@
+{
+  "debug": false,
+  "reset_on_crash_s": 0,
+  "joy": {"deadzone": 6},
+  "walk": {"min_samples": 0}
+}

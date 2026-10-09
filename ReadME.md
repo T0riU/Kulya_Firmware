@@ -42,8 +42,7 @@ Setup was done "on the knee" (quick and dirty, not a polished workflow, but it w
    - `Ctrl+C` again
 
    `Stop` triggers a soft reboot, and the two `Ctrl+C` presses interrupt the firmware's boot sequence so it doesn't start running before you can upload files.
-7. Select the needed files, hold **Shift** to select them all, and click **"Upload to /"** *(screenshot placeholder: upload dialog)*.
-
+7. Select all files from the `f/` folder (hold **Shift**) and click **"Upload to /"**. All files go to the board's root — there are no subfolders.
 ### Wiring
 
 ![](imagesMD/board.png)
@@ -78,44 +77,36 @@ Connect **RX/TX** on the servo controller board to **TX2/RX2** on the ESP32 — 
 
 ## How It Works
 
+The firmware is a **single loop with no threads**. Every tick it reads commands, computes target angles for the active gait, smooths them, and sends only the changed channels to the servo controller over UART.
+
 ### Startup
 
-**`boot.py`** — the first script executed when the board powers on. It waits 3 seconds (to allow interrupting the boot process via the REPL if you need to re-flash), then imports `run.py`.
+**`boot.py`** — runs on power-on. Optionally raises the CPU clock, waits `boot_delay_s` (3 s by default) so you can press `Ctrl+C` and get the REPL, then runs `main.run()` inside `try/except`. On a crash it prints the traceback and either stays in the REPL (default) or reboots after `reset_on_crash_s` seconds.
 
-**`run.py`** — brings up all subsystems in order:
-1. `esp_legs_setup` — creates 6 `Leg` objects
-2. `esp_ble.ESP32_BLE(...)` — starts the BLE server (advertising, command receiver)
-3. `esp_now_rx` + a hardware timer — the ESP-NOW receiver (physical remote), polled every 50 ms
-4. `esp_legmover.legmover` — a separate thread (`_thread`) that continuously computes angles → sends them to the servo controller over UART
-5. `esp_gait_selector.gait_selector()` — the main infinite loop, the command dispatcher
+**`main.py`** — creates the servo bus, `Robot`, `State` and `Engine`, starts BLE and ESP-NOW (each is optional — if one fails, the robot still boots), then runs the main loop. The first move after power-on uses a slow, safe speed (`vmax_boot`). If a tick raises an error, the robot falls back to `STOP`; only 25 errors in a row are fatal.
 
-### Shared State
+### Files
 
-**`esp_context.py`** — the single source of truth. The `RC_data` dictionary holds all control parameters (see the command table below). It is read and written by every other module. It also holds: `legmover_on` (a flag for whether the leg-movement thread is active), `ble_instance` (a reference to the BLE object so gaits can send replies), and `motion_smooth_rate` (how smoothly motion is interpolated when `speed:0`).
+| File | Role |
+|---|---|
+| `kconfig.py` | Loads defaults + `config.json`, `legs_config.json`, `calibration.json`, `radio_config.json` |
+| `proto.py` | `State` (all control parameters, the old `RC_data`) and the command parser. Values are validated and clamped; `J_XY` joystick handling and dead zone |
+| `engine.py` | The loop logic: link failsafe, one-shot actions (`SAVE`/`GETCAL`), smooth transition when the gait changes (`Settle`), calls the active gait |
+| `robot.py` | Joint state (`tgt` / `cur`), time-based interpolator, converts angles to pulses (hard clamp 500–2500 µs), sends only changed channels |
+| `kin.py` | Inverse kinematics (pure math, also runs on a PC) |
+| `servo.py` | The UART connection to the ch24 servo controller |
+| `radio_ble.py` | BLE server (Nordic UART Service). Each write is parsed immediately — no `\n` needed. On disconnect → `STOP` |
+| `radio_espnow.py` | ESP-NOW receiver (physical remote). Drains the whole queue on every poll; optional MAC allowlist |
+| `gait_base.py` | Base class for gaits |
+| `gait_walk.py` | `WALK` / `STOP` |
+| `gait_pose.py` | `CE`, `LEG`, `ROLL` |
+| `gait_show.py` | `DANCE`, `WAVE` |
+| `gait_cal.py` | `ZERO`, `ZEROALL`, `CAL`, saving calibration |
+| `dances_data.py` | Dances as data — add your own by appending to `DANCES` |
 
-**`esp_parse_update.py`** — parses incoming commands. Splits `param:value;...` into pairs and writes them into `RC_data`. It also has special handling for `J_XY` (joystick) — it converts `x|y` (-100..100) into `dx/dy/speed/turn_angle` or `rx/ry`, depending on `J_mode` (`steer` / `sides` / `shift` / `tilt`).
+### Gaits
 
-### Communication
-
-**`esp_ble.py`** — the BLE server (Nordic UART Service). It receives commands, **buffers incoming chunks and only parses them once it encounters `\n`** (without this, long commands would get cut off by the ~20-byte MTU limit). The `ESP32_BLE` class registers itself in `esp_context.ble_instance` so other modules can send replies through `.send(text)`. The on-board LED blinks until a connection is established, and stays solid once connected.
-
-**`esp_now_rx.py`** — the ESP-NOW receiver, used for the physical remote (not BLE). Each packet is a complete, standalone command (unlike BLE, ESP-NOW doesn't split messages into chunks).
-
-### Kinematics and Movement
-
-**`esp_Leg_class.py`** — the `Leg` class: geometry (segment lengths, angle limits per joint), servo pins, `invert` (whether to mirror the pulse on a given joint), and current/target/previous angles. It **does not know** the direction the legs are traversed around the body — the angle (`leg_angle`) is passed in from outside, computed by `esp_legs_setup.py`.
-
-**`esp_inverse_kinematics.py`** — inverse kinematics. `IK(leg, xyz)` converts coordinates into joint angles (clamped to the leg's limits). `getSpread_xyz(...)` converts stance parameters (spread/height/tilt/turn) into target leg coordinates.
-
-**`esp_legmover.py`** — a dedicated thread. Every `espi` ms it interpolates `current_angles` → `target_angles` (stepwise if `speed > 0`, smoothly if `speed:0`), builds a command string for the ch24 servo controller, and sends it over UART. It also contains `deg2pulse()` with a **hard clamp of 500–2500 μs** (no calibration value or angle can push a servo outside a safe range).
-
-**`esp_legs_setup.py`** — creates the 6 `Leg` objects, all sourced from JSON files (see the config section below). If `legs_config.json` is missing or corrupted, there's a minimal built-in fallback (matching the robot's original wiring) so the board can still boot, along with a warning in the REPL.
-
-### Gaits (`esp_gait_*.py`)
-
-Each file implements one `gait:NAME;` command, registered in `esp_gait_selector.py`. See the command table below for details.
-
-**`esp_gait_selector.py`** — the main dispatcher. Reads `RC_data["gait"]` and calls the corresponding function. It's wrapped in a `try/except` — if a gait raises an exception, the dispatcher doesn't die permanently; it rolls `gait` back to `STOP` and prints the reason to the REPL.
+Each gait is an object with `enter()` / `step(dt)` / `exit()`, registered in `engine.py`. When the gait changes, the robot first moves smoothly into the new gait's starting pose, then the gait takes over — no jerk. Walking is computed continuously in Cartesian space (stance is a line, swing is an arc), so start/stop are smooth and the legs don't lift when the stride is zero.
 
 ### JSON Configuration Files — Changeable Without Reflashing
 
@@ -123,7 +114,7 @@ Each file implements one `gait:NAME;` command, registered in `esp_gait_selector.
 
 ```json
 {
-  "legs_clockwise": false,
+  "legs_clockwise": true,
   "0": {"pins": [1, 2, 3],    "invert": [true, false, true]},
   "1": {"pins": [6, 7, 8],    "invert": [true, false, true]},
   "2": {"pins": [9, 10, 11],  "invert": [true, false, true]},
@@ -139,7 +130,7 @@ Each file implements one `gait:NAME;` command, registered in `esp_gait_selector.
   - `invert` — `[coxa, femur, tibia]`, whether to mirror (`3000 - pulse`) the pulse on that joint of that leg. Needed when servos on different legs are physically mounted differently.
 
 Read once at startup — changes require rebooting the board.
-
+If `legs_config.json` is missing or invalid (wrong pin count, duplicate pins), the firmware falls back to built-in wiring and prints a warning in the REPL.
 #### `calibration.json` — calibration (written automatically by the `SAVE` gait)
 
 ```json
@@ -148,28 +139,79 @@ Read once at startup — changes require rebooting the board.
 
 `{"leg_num": [coxa_offset, femur_offset, tibia_offset]}`, in degrees. If the file doesn't exist, every leg starts with a `[0,0,0]` calibration. It can be edited by hand, but it's usually easier to do it through the `CAL` + `SAVE` gaits from the remote.
 
+#### `config.json` — everything else (optional, only list what you want to change)
+
+Missing keys use built-in defaults, and nested sections are merged. The shipped file:
+
+```json
+{
+  "debug": false,
+  "reset_on_crash_s": 0,
+  "joy": {"deadzone": 6},
+  "walk": {"min_samples": 0}
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ble_name` | `KULYA v4 OpenSource DIY` | BLE name (kept so the app finds the robot) |
+| `boot_delay_s` | 3 | Window to press `Ctrl+C` before startup |
+| `reset_on_crash_s` | 0 | `0` = stay in REPL after a crash; `>0` = reboot after N seconds |
+| `debug` | false | Prints state ~2×/s (slow, keep off) |
+| `wdt_ms` | 0 | Hardware watchdog (0 = off) |
+| `cpu_freq_mhz` | 0 | `0` = default; e.g. `240` for max clock |
+| `uart` | `id 2, baud 9600` | Servo controller UART. **Raise `baud` to 115200 if your controller supports it** — motion becomes much smoother |
+| `tick_ms` | 20 | Target loop period (auto-stretched if UART is slow) |
+| `geometry`, `poses` | — | Leg dimensions, joint limits, fold pose |
+| `motion` | — | Speed caps and smoothing |
+| `walk` | — | `cycle_ms`, lift height, `min_samples` |
+| `joy.deadzone` | 6 | Joystick dead zone, % |
+| `link.timeout_ms` | 0 | `>0` = stop the robot if no command arrives for N ms |
+| `link.espnow_peers` | `[]` | Allowed remote MACs; empty = accept anyone |
+| `dance` | — | `lift_mm`, `move_frac` |
+
+#### `radio_config.json` — ESP-NOW channel (optional)
+
+```json
+{"channel": 6}
+```
+Channel 1–14, default 6. Must match the remote.
+
+`{"leg_num": [coxa_offset, femur_offset, tibia_offset]}`, in degrees. If the file doesn't exist, every leg starts with a `[0,0,0]` calibration. It can be edited by hand, but it's usually easier to do it through the `CAL` + `SAVE` gaits from the remote.
+
 ### Full Command Reference
 
-Format: `gait:NAME;parameter:value;parameter:value;\n`
-(or just `parameter:value;` without changing the gait — updates `RC_data` on the fly)
+Format: `gait:NAME;parameter:value;parameter:value;` (or just `parameter:value;` without changing the gait — updates the state on the fly). Values are validated and clamped to a safe range; fractional numbers (`speed:50.5`) are accepted; bad pairs are skipped.
 
 | Gait | Parameters | What It Does |
 |---|---|---|
-| `WALK` | `speed, height, raise, spread, turn_angle, dx, dy, rx, ry, rz` | Tripod gait walking. `speed:0` — stand still, holding the pose |
-| `STOP` | — | No handler; legs freeze in their current position |
+| `WALK` | `speed, height, raise, spread, turn_angle, dx, dy, rx, ry, rz, wtype` | Walking. `wtype`: `0` tripod, `1` pairs, `2` wave (one leg at a time). `speed:0` — stand still, holding the pose |
+| `STOP` | — | Smooth return to the standing pose (not a freeze) |
 | `CE` | `ce_value` (0-100) | Synchronously folds/unfolds all legs |
 | `ROLL` | `speed, roll_range, roll_turn` | Experimental — opens legs one by one around the circle |
 | `LEG` | `leg_num, coxa, femur, tibia` | Manual jog of a single leg (absolute angle, clamped to joint limits) |
-| `CAL` | `leg_num, coxa, femur, tibia` | Calibration — the same 3 numbers, but as an offset (±20° max); the leg holds at 0/0/0 |
-| `ZERO` | `leg_num` | Puts one leg at the servo's true center (1500 μs), ignoring calibration — for mounting the horn |
-| `ZEROALL` | — | Same as `ZERO`, but for all 6 legs at once |
-| `SAVE` | — | One-shot: writes the current calibration to `calibration.json`, then returns to `CAL` |
-| `GETCAL` | `leg_num` | One-shot: sends back `CAL:N:coxa,femur,tibia;` via BLE notify, then returns to `CAL` |
-| `WAVE` | `leg_num` | One leg waves (held for the whole cycle), then automatically returns to `WALK` |
-| `DANCE` | `dance_id` (0/1/2) | Dances in a loop until the gait is changed; `dance_id` can be changed on the fly |
-| — (not a gait) | `J_XY:x\|y` (-100..100) | Joystick input, converted depending on `J_mode` |
-| — (not a gait) | `J_mode` (`steer`/`sides`/`shift`/`tilt`) | How to interpret joystick input |
+| `CAL` | `leg_num, coxa, femur, tibia` | Calibration offset (±20° max). Only the fields you actually send are changed |
+| `ZERO` | `leg_num` | One leg to the servo's true center (1500 µs), ignoring calibration — for mounting the horn |
+| `ZEROALL` | — | Same as `ZERO`, for all legs |
+| `SAVE` | — | One-shot: writes calibration to `calibration.json` (atomic write), then switches to `CAL` |
+| `GETCAL` | `leg_num` | One-shot: replies `CAL:coxa,femur,tibia;` via BLE notify, then switches to `CAL` |
+| `WAVE` | `leg_num` | Any leg waves, then automatically returns to `WALK` |
+| `DANCE` | `dance_id` (0–9, `255` = all), `tempo` (20–300, default 100) | Dances in a loop until the gait is changed; both can be changed on the fly |
+| — (not a gait) | `J_XY:x\|y` (-100..100) | Joystick input, converted depending on `J_mode`. A real deflection in `steer`/`sides` returns the robot to `WALK` from `STOP`/`DANCE`/`CE`/`ROLL`/`WAVE` |
+| — (not a gait) | `J_mode` (`steer`/`sides`/`shift`/`tilt`/`yaw`) | How to interpret the joystick. `yaw` rotates the body in place |
 | — (not a gait) | `espi`, `servoi` | Update intervals (ms), rarely need touching |
+
+#### Dances (`dance_id`)
+
+| id | Name | id | Name |
+|---|---|---|---|
+| 0 | Sway | 5 | Breathe |
+| 1 | Bounce | 6 | Squats |
+| 2 | Shimmy | 7 | Disco |
+| 3 | Hula | 8 | Heartbeat |
+| 4 | March | 9 | Twist |
+
+`255` plays all of them back to back.
 
 #### Dances (`dance_id`)
 
@@ -231,7 +273,7 @@ Ukrainian Robotics – Kulya 4.0 — це платформа гексапода 
    - `Ctrl+C` ще раз
 
    `Stop` вмикає софт-ребут, а два `Ctrl+C` зупиняють завантаження прошивки, щоб вона не встигла запуститись до того, як можна буде завантажити файли.
-7. Вибрати потрібні файли, утримуючи **Shift** вибрати всі, і натиснути **"Upload to /"** *(картинка вікна завантаження)*.
+7. Вибрати всі файли з папки `f/` (утримуючи **Shift**) і натиснути **"Upload to /"**. Усі файли йдуть у корінь плати — підпапок немає.
 
 ### Підключення
 
@@ -267,52 +309,43 @@ Ukrainian Robotics – Kulya 4.0 — це платформа гексапода 
 
 ## Як це працює
 
+Прошивка — **один цикл без потоків**. Кожен тік: читає команди, рахує цільові кути для активного гейта, згладжує їх і шле на сервоконтролер по UART лише ті канали, що змінились.
+
 ### Запуск
 
-**`boot.py`** — перше, що виконується при старті плати. Чекає 3 секунди (щоб встигнути перервати завантаження через REPL, якщо треба перепрошити), потім імпортує `run.py`.
+**`boot.py`** — виконується при старті плати. За потреби піднімає частоту CPU, чекає `boot_delay_s` (за замовчуванням 3 с), щоб встигнути натиснути `Ctrl+C` і потрапити в REPL, потім викликає `main.run()` у `try/except`. При збої друкує traceback і або лишається в REPL (за замовчуванням), або перезавантажується через `reset_on_crash_s` секунд.
 
-**`run.py`** — піднімає всі підсистеми по черзі:
-1. `esp_legs_setup` — створює 6 об'єктів `Leg`
-2. `esp_ble.ESP32_BLE(...)` — запускає BLE-сервер (реклама, приймач команд)
-3. `esp_now_rx` + апаратний таймер — приймач ESP-NOW (фізичний пульт), опитується раз на 50мс
-4. `esp_legmover.legmover` — окремий потік (`_thread`), безперервно рахує кути → шле на сервоконтролер по UART
-5. `esp_gait_selector.gait_selector()` — головний нескінченний цикл, диспетчер команд
+**`main.py`** — створює шину серво, `Robot`, `State` та `Engine`, запускає BLE та ESP-NOW (кожен необов'язковий — якщо один не стартував, робот все одно завантажиться) і крутить головний цикл. Перший рух після старту — повільний і безпечний (`vmax_boot`). Якщо тік кидає помилку, робот відкочується в `STOP`; фатальними є лише 25 помилок підряд.
 
-### Спільний стан
+### Файли
 
-**`esp_context.py`** — єдине джерело правди. Словник `RC_data` — усі параметри керування (див. таблицю команд нижче). Його читають/пишуть усі інші модулі. Також тут: `legmover_on` (флаг, чи активний потік руху ніг), `ble_instance` (посилання на BLE-об'єкт, щоб гейти могли слати відповіді), `motion_smooth_rate` (наскільки плавно згладжується рух при `speed:0`).
+| Файл | Роль |
+|---|---|
+| `kconfig.py` | Завантажує значення за замовчуванням + `config.json`, `legs_config.json`, `calibration.json`, `radio_config.json` |
+| `proto.py` | `State` (усі параметри керування, колишній `RC_data`) і парсер команд. Значення перевіряються й обрізаються; обробка джойстика `J_XY` та мертва зона |
+| `engine.py` | Логіка циклу: failsafe за зв'язком, одноразові дії (`SAVE`/`GETCAL`), плавний перехід при зміні гейта (`Settle`), виклик активного гейта |
+| `robot.py` | Стан суглобів (`tgt` / `cur`), інтерполятор за часом, перетворення кутів в імпульси (жорсткий кламп 500–2500 мкс), відправка лише змінених каналів |
+| `kin.py` | Зворотна кінематика (чиста математика, працює і на ПК) |
+| `servo.py` | UART-з'єднання з ch24-сервоконтролером |
+| `radio_ble.py` | BLE-сервер (Nordic UART Service). Кожен запис парситься одразу — `\n` не потрібен. При відключенні → `STOP` |
+| `radio_espnow.py` | Приймач ESP-NOW (фізичний пульт). На кожному опитуванні вичитує всю чергу; опційний список дозволених MAC |
+| `gait_base.py` | Базовий клас гейтів |
+| `gait_walk.py` | `WALK` / `STOP` |
+| `gait_pose.py` | `CE`, `LEG`, `ROLL` |
+| `gait_show.py` | `DANCE`, `WAVE` |
+| `gait_cal.py` | `ZERO`, `ZEROALL`, `CAL`, збереження калібрування |
+| `dances_data.py` | Танці як дані — свій танець додається в кінець `DANCES` |
 
-**`esp_parse_update.py`** — парсер вхідних команд. Розбиває `param:value;...` на пари, кладе в `RC_data`. Окремо обробляє `J_XY` (джойстик) — конвертує `x|y` (-100..100) в `dx/dy/speed/turn_angle` або `rx/ry`, залежно від `J_mode` (`steer` / `sides` / `shift` / `tilt`).
+### Гейти
 
-### Зв'язок
-
-**`esp_ble.py`** — BLE-сервер (Nordic UART Service). Приймає команди, **накопичує вхідні шматки в буфер і парсить лише коли зустріне `\n`** (без цього довгі команди різались через ліміт MTU ~20 байт). Клас `ESP32_BLE` сам реєструє себе в `esp_context.ble_instance`, щоб інші модулі могли слати відповіді через `.send(text)`. Світлодіод on-board блимає поки не підключено, горить рівно коли підключено.
-
-**`esp_now_rx.py`** — приймач ESP-NOW, для фізичного пульта (не BLE). Кожен пакет — окрема повна команда (ESP-NOW не ріже на шматки, як BLE).
-
-### Кінематика й рух
-
-**`esp_Leg_class.py`** — клас `Leg`: геометрія (довжини сегментів, ліміти кутів кожного суглоба), піни сервоприводів, `invert` (чи дзеркалити імпульс на суглобі), поточні/цільові/попередні кути. **Не знає** напрямку обходу ніг по колу — кут (`leg_angle`) йому передають ззовні, рахує `esp_legs_setup.py`.
-
-**`esp_inverse_kinematics.py`** — зворотна кінематика. `IK(leg, xyz)` — координати → кути суглобів (з клампом по лімітах ноги). `getSpread_xyz(...)` — параметри стійки (spread/height/tilt/turn) → цільові координати ноги.
-
-**`esp_legmover.py`** — окремий потік. Кожні `espi` мс інтерполює `current_angles` → `target_angles` (ступінчасто, якщо `speed>0`, плавно згладжено якщо `speed:0`), формує рядок команди для ch24-контролера й шле по UART. Тут же — `deg2pulse()` з **жорстким клампом 500-2500 мкс** (ніяке значення калібрування/кута не може вивести серву за безпечний діапазон).
-
-**`esp_legs_setup.py`** — створює 6 об'єктів `Leg`, все з JSON-файлів (див. розділ нижче). Якщо `legs_config.json` не знайдено/пошкоджено — є мінімальний вбудований фолбек (той самий wiring, що робот мав спочатку), щоб плата хоч якось завантажилась, з попередженням в REPL.
-
-### Гейти (`esp_gait_*.py`)
-
-Кожен файл — одна команда `gait:ИМЯ;`, зареєстрована в `esp_gait_selector.py`. Детально — в таблиці команд нижче.
-
-**`esp_gait_selector.py`** — головний диспетчер. Читає `RC_data["gait"]`, викликає відповідну функцію. Обгорнуто в `try/except` — якщо гейт впаде з винятком, диспетчер не вмирає назавжди, а відкочує `gait` в `STOP` і пише причину в REPL.
-
+Кожен гейт — об'єкт з `enter()` / `step(dt)` / `exit()`, зареєстрований в `engine.py`. При зміні гейта робот спершу плавно переходить у стартову позу нового гейта, і лише потім той бере керування — без ривка. Ходьба рахується безперервно в декартових координатах (опора — пряма, перенос — дуга), тому старт/зупинка плавні, а ноги не піднімаються при нульовому кроці.
 ### JSON-конфіги — що можна міняти без перепрошивки коду
 
 #### `legs_config.json` — залізо (не пишеться кодом автоматично, редагуй руками)
 
 ```json
 {
-  "legs_clockwise": false,
+  "legs_clockwise": true,
   "0": {"pins": [1, 2, 3],    "invert": [true, false, true]},
   "1": {"pins": [6, 7, 8],    "invert": [true, false, true]},
   "2": {"pins": [9, 10, 11],  "invert": [true, false, true]},
@@ -328,6 +361,7 @@ Ukrainian Robotics – Kulya 4.0 — це платформа гексапода 
   - `invert` — `[coxa, femur, tibia]`, чи дзеркалити (`3000 - pulse`) імпульс на цьому суглобі цієї ноги. Потрібно, якщо сервоприводи на різних ногах фізично закріплені по-різному.
 
 Читається один раз при старті — зміни вимагають перезавантаження плати.
+Якщо `legs_config.json` не знайдено або він некоректний (неправильна кількість пінів, дублікати), використовується вбудований wiring і в REPL виводиться попередження.
 
 #### `calibration.json` — калібрування (пишеться автоматично гейтом `SAVE`)
 
@@ -336,33 +370,76 @@ Ukrainian Robotics – Kulya 4.0 — це платформа гексапода 
 ```
 
 `{"leg_num": [coxa_offset, femur_offset, tibia_offset]}`, градуси. Якщо файлу немає — усі ноги стартують з калібруванням `[0,0,0]`. Редагувати руками можна, але зазвичай простіше через гейт `CAL` + `SAVE` з пульта.
+#### `config.json` — решта налаштувань (необов'язковий, пишіть лише те, що хочете змінити)
 
+Відсутні ключі беруть значення за замовчуванням, вкладені секції зливаються. Файл у збірці:
+
+```json
+{
+  "debug": false,
+  "reset_on_crash_s": 0,
+  "joy": {"deadzone": 6},
+  "walk": {"min_samples": 0}
+}
+```
+
+| Ключ | За замовч. | Значення |
+|---|---|---|
+| `ble_name` | `KULYA v4 OpenSource DIY` | Ім'я BLE (лишили, щоб застосунок знаходив робота) |
+| `boot_delay_s` | 3 | Вікно для `Ctrl+C` перед стартом |
+| `reset_on_crash_s` | 0 | `0` = лишитись у REPL після збою; `>0` = перезавантаження через N с |
+| `debug` | false | Друк стану ~2×/с (повільно, вимкнено) |
+| `wdt_ms` | 0 | Апаратний watchdog (0 = вимкнено) |
+| `cpu_freq_mhz` | 0 | `0` = за замовчуванням; напр. `240` — максимум |
+| `uart` | `id 2, baud 9600` | UART сервоконтролера. **Підніміть `baud` до 115200, якщо контролер підтримує** — рух стане набагато плавнішим |
+| `tick_ms` | 20 | Цільовий період циклу (автоматично збільшується при повільному UART) |
+| `geometry`, `poses` | — | Розміри ніг, ліміти суглобів, складена поза |
+| `motion` | — | Ліміти швидкості та згладжування |
+| `walk` | — | `cycle_ms`, висота підйому, `min_samples` |
+| `joy.deadzone` | 6 | Мертва зона джойстика, % |
+| `link.timeout_ms` | 0 | `>0` = зупинити робота, якщо команд немає N мс |
+| `link.espnow_peers` | `[]` | Дозволені MAC пультів; порожньо = приймати від усіх |
+| `dance` | — | `lift_mm`, `move_frac` |
+
+#### `radio_config.json` — канал ESP-NOW (необов'язковий)
+
+```json
+{"channel": 6}
+```
+Канал 1–14, за замовчуванням 6. Має збігатися з пультом.
 ### Всі команди
 
-Формат: `gait:ИМЯ;параметр:значення;параметр:значення;\n` (або просто `параметр:значення;` без зміни гейта — оновлює `RC_data` на льоту)
+Формат: `gait:ІМ'Я;параметр:значення;параметр:значення;` (або просто `параметр:значення;` без зміни гейта — оновлює стан на льоту). Значення перевіряються й обрізаються до безпечного діапазону; дробові числа (`speed:50.5`) приймаються; некоректні пари пропускаються.
 
 | Гейт | Параметри | Що робить |
 |---|---|---|
-| `WALK` | `speed, height, raise, spread, turn_angle, dx, dy, rx, ry, rz` | Хода тріподом. `speed:0` — стояти, тримаючи позу |
-| `STOP` | — | Немає обробника, ноги застигають у поточному положенні |
+| `WALK` | `speed, height, raise, spread, turn_angle, dx, dy, rx, ry, rz, wtype` | Ходьба. `wtype`: `0` тріпод, `1` пари, `2` хвиля (по одній нозі). `speed:0` — стояти, тримаючи позу |
+| `STOP` | — | Плавне повернення в стійку (не «застигання») |
 | `CE` | `ce_value` (0-100) | Синхронне складання/розкладання всіх ніг |
 | `ROLL` | `speed, roll_range, roll_turn` | Експериментальна — по черзі відкриває ноги по колу |
 | `LEG` | `leg_num, coxa, femur, tibia` | Ручний джог однієї ноги (абсолютний кут, обрізається лімітами суглоба) |
-| `CAL` | `leg_num, coxa, femur, tibia` | Калібрування — ті самі 3 числа як offset (±20° макс), нога тримається в 0/0/0 |
-| `ZERO` | `leg_num` | Одна нога в чистий центр серво (1500мкс), ігнорує калібрування — для монтажу рожка |
-| `ZEROALL` | — | Те саме, всі 6 ніг одразу |
-| `SAVE` | — | Одноразово: пише поточне калібрування в `calibration.json`, повертається в `CAL` |
-| `GETCAL` | `leg_num` | Одноразово: шле назад `CAL:N:coxa,femur,tibia;` через BLE notify, повертається в `CAL` |
-| `WAVE` | `leg_num` | Одна нога махає (фіксується на весь цикл), потім сам повертається в `WALK` |
-| `DANCE` | `dance_id` (0/1/2) | Танцює по колу, поки не зміниш гейт; `dance_id` можна міняти на льоту |
-| — (не гейт) | `J_XY:x\|y` (-100..100) | Джойстик, конвертується залежно від `J_mode` |
-| — (не гейт) | `J_mode` (`steer`/`sides`/`shift`/`tilt`) | Як інтерпретувати джойстик |
+| `CAL` | `leg_num, coxa, femur, tibia` | Офсет калібрування (±20° макс). Змінюються лише ті поля, що реально надіслані |
+| `ZERO` | `leg_num` | Одна нога в чистий центр серво (1500 мкс), ігнорує калібрування — для монтажу рожка |
+| `ZEROALL` | — | Те саме, для всіх ніг |
+| `SAVE` | — | Одноразово: пише калібрування в `calibration.json` (атомарний запис), далі перехід у `CAL` |
+| `GETCAL` | `leg_num` | Одноразово: шле `CAL:coxa,femur,tibia;` через BLE notify, далі перехід у `CAL` |
+| `WAVE` | `leg_num` | Махає будь-яка нога, потім автоматично повертається в `WALK` |
+| `DANCE` | `dance_id` (0–9, `255` = усі), `tempo` (20–300, за замовч. 100) | Танцює по колу, поки не зміниш гейт; обидва параметри можна міняти на льоту |
+| — (не гейт) | `J_XY:x\|y` (-100..100) | Джойстик, конвертується залежно від `J_mode`. Реальне відхилення в `steer`/`sides` повертає робота в `WALK` зі `STOP`/`DANCE`/`CE`/`ROLL`/`WAVE` |
+| — (не гейт) | `J_mode` (`steer`/`sides`/`shift`/`tilt`/`yaw`) | Як інтерпретувати джойстик. `yaw` — поворот корпусу на місці |
 | — (не гейт) | `espi`, `servoi` | Інтервали оновлення (мс), рідко треба чіпати |
 
 #### Танці (`dance_id`)
 
-- **0 — Sway**: повільні нахили вперед/назад/вбік + повороти
-- **1 — Bounce**: швидкий присід-підйом + оберти
+| id | Назва | id | Назва |
+|---|---|---|---|
+| 0 | Sway | 5 | Breathe |
+| 1 | Bounce | 6 | Squats |
+| 2 | Shimmy | 7 | Disco |
+| 3 | Hula | 8 | Heartbeat |
+| 4 | March | 9 | Twist |
+
+`255` програє всі підряд.
 
 ## Використання
 
